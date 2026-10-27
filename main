@@ -1,0 +1,260 @@
+# -*- coding: utf-8 -*-
+"""
+ЗАДАНИЕ (основа для студента).
+
+Перепишите клиента блокчейн-сети на ООП. Нужно реализовать два класса —
+Block и StudentClient — и дописать методы, помеченные «# TODO».
+Обязательные условия:
+  1) вся логика оформлена через классы и методы (ООП);
+  2) при создании объектов используйте и ИМЕНОВАННЫЕ (keyword), и
+     НЕИМЕНОВАННЫЕ (позиционные) аргументы;
+  3) в блоке должны быть ваши ФАМИЛИЯ и ГРУППА;
+  4) сервер teacher_server.py менять НЕЛЬЗЯ.
+
+Запуск:
+    pip install requests
+    python student_client_task.py
+"""
+import hashlib
+import ipaddress
+import re
+import socket
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+
+
+class Block:
+    """Один блок цепочки. Хранит данные и умеет считать свой хэш и майнить."""
+    NUM_ZEROS = 4   # сложность Proof-of-Work (должно совпадать с сервером)
+
+    def __init__(self, index, surname, group, prev_hash,
+                 message="Привет, блокчейн!", timestamp=None, nonce=0):
+        # поля блока уже заданы — трогать не нужно
+        self.index = index
+        self.surname = surname
+        self.group = group
+        self.message = message
+        self.prev_hash = prev_hash
+        self.timestamp = timestamp if timestamp is not None else time.time()
+        self.nonce = nonce
+        self.hash = None
+
+    @property
+    def data(self):
+        """Данные блока одной строкой (фамилия, группа, сообщение). НЕ менять формат!"""
+        return f"{self.surname}, группа {self.group} — {self.message}"
+
+    def header(self):
+        """Заголовок для хэширования. Формат ДОЛЖЕН совпадать с сервером — не менять."""
+        return f"{self.index}|{self.prev_hash}|{self.data}|{self.timestamp}|{self.nonce}"
+
+    def calc_hash(self):
+        """Вернуть SHA-256 заголовка блока, закодированного в UTF-8."""
+        return hashlib.sha256(self.header().encode("utf-8")).hexdigest()
+
+    def mine(self):
+        """Подобрать nonce и вернуть nonce и хэш с четырьмя нулями."""
+        target = "0" * Block.NUM_ZEROS
+        while True:
+            self.hash = self.calc_hash()
+            if self.hash.startswith(target):
+                return self.nonce, self.hash
+            self.nonce += 1
+
+    def to_dict(self):
+        """Собрать все поля блока в формате сервера."""
+        return {
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "data": self.data,
+            "surname": self.surname,
+            "group": self.group,
+            "prev_hash": self.prev_hash,
+            "nonce": self.nonce,
+            "hash": self.hash,
+        }
+
+
+class StudentClient:
+    """Клиент студента: общается с сервером преподавателя и присоединяет блок."""
+
+    def __init__(self, server_url, surname, group):
+        if not server_url:
+            server_url = self.discover_server()
+        url = server_url.strip().rstrip("/")
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "http://" + url
+        self.server = url
+        self.surname = surname
+        self.group = group
+
+    @staticmethod
+    def local_networks():
+        """Найти небольшие IPv4-подсети адаптеров Windows со шлюзом."""
+        result = subprocess.run(
+            ["ipconfig"], capture_output=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        text = result.stdout.decode("utf-8", errors="replace")
+        networks = set()
+        ipv4 = r"(?:\d{1,3}\.){3}\d{1,3}"
+        for adapter in re.split(r"\r?\n\s*\r?\n", text):
+            match = re.search(
+                rf"IPv4[^\r\n]*?:\s*({ipv4})[^\r\n]*\r?\n"
+                rf"[^\r\n]*?:\s*({ipv4})([^\n]*(?:\n[^\n]*)*)",
+                adapter,
+            )
+            if not match:
+                continue
+            address, mask, remainder = match.groups()
+            # После маски должен быть IPv4-шлюз этого адаптера.
+            if not re.search(ipv4, remainder):
+                continue
+            network = ipaddress.IPv4Network(f"{address}/{mask}", strict=False)
+            if network.is_private and not network.is_loopback:
+                if network.num_addresses <= 1024:
+                    networks.add(network)
+                else:
+                    print(f"Пропущена большая подсеть {network}: укажите адрес вручную.")
+        return sorted(networks, key=lambda network: int(network.network_address))
+
+    @staticmethod
+    def probe_server(host, port=5000):
+        """Проверить порт и два API блокчейна, не отправляя блоки."""
+        url = f"http://{host}:{port}"
+        try:
+            with socket.create_connection((str(host), port), timeout=0.4):
+                pass
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.get(
+                    f"{url}/last_block", timeout=1, allow_redirects=False
+                )
+                if response.status_code != 200:
+                    return None
+                last = response.json()
+                if not isinstance(last, dict):
+                    return None
+                if type(last.get("index")) is not int or last["index"] < 0:
+                    return None
+                if not isinstance(last.get("hash"), str):
+                    return None
+                if not re.fullmatch(r"[0-9a-fA-F]{64}", last["hash"]):
+                    return None
+                response = session.get(
+                    f"{url}/chain", timeout=1, allow_redirects=False
+                )
+                if response.status_code != 200:
+                    return None
+                payload = response.json()
+                chain = payload.get("chain") if isinstance(payload, dict) else None
+                if not isinstance(chain, list) or not chain:
+                    return None
+                if not all(isinstance(block, dict) for block in chain):
+                    return None
+                if not any(
+                    block.get("index") == last["index"]
+                    and block.get("hash") == last["hash"] for block in chain
+                ):
+                    return None
+            return url
+        except (OSError, requests.RequestException, ValueError):
+            return None
+
+    @classmethod
+    def discover_server(cls):
+        """Найти сервер автоматически; при нескольких предложить выбор."""
+        local = cls.probe_server("127.0.0.1")
+        if local:
+            print(f"Найден сервер: {local}")
+            return local
+        networks = cls.local_networks()
+        if not networks:
+            raise RuntimeError("Не найдена локальная IPv4-подсеть для поиска сервера.")
+        hosts = sorted({str(host) for network in networks for host in network.hosts()})
+        print("Поиск сервера на порту 5000: " + ", ".join(map(str, networks)))
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            found = sorted({url for url in pool.map(cls.probe_server, hosts) if url})
+        if not found:
+            raise RuntimeError(
+                "Сервер не найден. Преподавателю нужно запустить сервер с доступом "
+                "из локальной сети на порту 5000. Возможны блокировка порта "
+                "или изоляция устройств в сети."
+            )
+        if len(found) == 1:
+            print(f"Найден сервер: {found[0]}")
+            return found[0]
+        print("Найдено несколько серверов:")
+        for number, url in enumerate(found, 1):
+            print(f"  {number}. {url}")
+        while True:
+            choice = input("Номер сервера преподавателя: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(found):
+                return found[int(choice) - 1]
+            print("Введите номер из списка.")
+
+    def get_last_block(self):
+        """GET /last_block — последний блок цепочки (готовый метод)."""
+        return requests.get(f"{self.server}/last_block", timeout=10).json()
+
+    def create_block(self, last, message):
+        """Создать следующий блок с позиционными и именованными аргументами."""
+        return Block(
+            last["index"] + 1,
+            self.surname,
+            self.group,
+            last["hash"],
+            message=message,
+        )
+
+    def submit(self, block):
+        """Отправить блок через POST /add_block и вернуть статус и JSON."""
+        response = requests.post(
+            f"{self.server}/add_block", json=block.to_dict(), timeout=10
+        )
+        return response.status_code, response.json()
+
+    def show_chain(self):
+        """Показать текущую цепочку преподавателя (готовый метод)."""
+        chain = requests.get(f"{self.server}/chain", timeout=10).json()["chain"]
+        print("\nТекущая цепочка преподавателя:")
+        for b in chain:
+            who = "ГЕНЕЗИС" if b["index"] == 0 else f"{b['surname']} (гр. {b['group']})"
+            print(f"  #{b['index']:>2}  {who:<30} hash={b['hash'][:12]}…  prev={b['prev_hash'][:12]}…")
+
+    def run(self, message="Привет, блокчейн!"):
+        """Главный сценарий (готов). Он вызывает ваши методы create_block/mine/submit."""
+        print(f"Подключаюсь к {self.server}  как  {self.surname} (гр. {self.group})")
+        for attempt in range(1, 6):
+            last = self.get_last_block()
+            block = self.create_block(last, message)
+            print(f"[Попытка {attempt}] Майнинг блока #{block.index} … "
+                  f"(ищем хэш с {Block.NUM_ZEROS} нулями)")
+            nonce, h = block.mine()
+            print(f"  Найден nonce={nonce}, hash={h[:20]}…  отправляем преподавателю…")
+            status, res = self.submit(block)
+            if res.get("accepted"):
+                print(f"\n✔ БЛОК ПРИНЯТ! Ваш блок #{res['index']} добавлен в цепочку. "
+                      f"Длина цепочки: {res['chain_length']}.")
+                break
+            print(f"✖ Блок отклонён: {res.get('reason')}")
+            if status == 409 and "last_block" in res:
+                print("  Цепочка изменилась — перемайниваем…")
+                continue
+            break
+        self.show_chain()
+
+
+if __name__ == "__main__":
+    # ПРИМЕР использования аргументов (по заданию нужны оба вида):
+    #   именованные (keyword) аргументы — при создании клиента:
+    try:
+        client = StudentClient(server_url=None,
+                               surname="Елизаров любимый", group="ОКБП-401ИТМП")
+        #   неименованный (позиционный) аргумент — при вызове метода:
+        client.run("Мой блок на ООП")
+    except (RuntimeError, requests.RequestException, OSError) as error:
+        print(f"Ошибка подключения: {error}")
